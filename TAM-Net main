@@ -1,15 +1,12 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Concatenate, Layer
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
 
-class ResidualBlock(Layer):
+class ResidualBlock(tf.keras.layers.Layer):
     def __init__(self, hidden_dim):
         super(ResidualBlock, self).__init__()
-        self.dense1 = Dense(hidden_dim, activation='relu')
-        self.dense2 = Dense(hidden_dim)
+        self.dense1 = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.dense2 = tf.keras.layers.Dense(hidden_dim)
         self.relu = tf.keras.layers.ReLU()
-
+        
     def call(self, x):
         residual = x
         x = self.dense1(x)
@@ -17,91 +14,66 @@ class ResidualBlock(Layer):
         x += residual
         return self.relu(x)
 
-class SharedNetwork(Model):
+class AttentionModule(tf.keras.layers.Layer):
+    def __init__(self, hidden_dim):
+        super(AttentionModule, self).__init__()
+        self.dense = tf.keras.layers.Dense(hidden_dim, activation='relu')
+        self.attention_weights = tf.keras.layers.Dense(hidden_dim, activation='softmax')
+        
+    def call(self, x, prev_attention=None):
+        if prev_attention is not None:
+            x = x + prev_attention  # 前面的注意力模块影响后面的
+        x = self.dense(x)
+        attention = self.attention_weights(x)
+        return x * attention, attention
+
+class SharedNetwork(tf.keras.layers.Layer):
     def __init__(self):
         super(SharedNetwork, self).__init__()
-        # Initial encoding layers for each feature set
-        self.spi_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
-        self.tei_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
-        self.thi_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
-        self.sti_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
+        self.input_layers = [tf.keras.layers.Dense(128, activation='relu') for _ in range(4)]
+        self.fc_layers = [tf.keras.layers.Dense(128, activation='relu'), tf.keras.layers.Dense(64, activation='relu')]
+        self.residual_blocks = [ResidualBlock(128) for _ in range(3)]
+        self.final_fc = tf.keras.layers.Dense(64, activation='relu')
 
-        # Concatenate layer and additional FC layer after concatenation
-        self.concat_fc = Dense(256, activation='relu')
-        self.final_fc = Dense(64, activation='relu')
-        
-        # Residual blocks
-        self.res_blocks = [ResidualBlock(128) for _ in range(3)]
-        
     def call(self, inputs):
-        spi, tei, thi, sti = inputs
+        encoded_features = [layer(x) for layer, x in zip(self.input_layers, inputs)]
+        x = tf.concat(encoded_features, axis=-1)
         
-        # Encode each feature type
-        for fc_layer in self.spi_fc:
-            spi = fc_layer(spi)
-        for fc_layer in self.tei_fc:
-            tei = fc_layer(tei)
-        for fc_layer in self.thi_fc:
-            thi = fc_layer(thi)
-        for fc_layer in self.sti_fc:
-            sti = fc_layer(sti)
+        for layer in self.fc_layers:
+            x = layer(x)
+        
+        for block in self.residual_blocks:
+            x = block(x)
+        
+        return self.final_fc(x)
 
-        # Concatenate encoded features
-        x = Concatenate()([spi, tei, thi, sti])
-        x = self.concat_fc(x)
-        
-        # Residual blocks
-        for res_block in self.res_blocks:
-            x = res_block(x)
-        
-        # Final FC layer after residual blocks
-        x = self.final_fc(x)
-        return x
-
-class TaskSpecificNetwork(Model):
+class MTANModel(tf.keras.Model):
     def __init__(self):
-        super(TaskSpecificNetwork, self).__init__()
-        self.dense1 = Dense(64, activation='relu')
-        self.output_layer = Dense(1)
-
-    def call(self, x):
-        x = self.dense1(x)
-        return self.output_layer(x)
-
-class MultiTaskAttentionNetwork(Model):
-    def __init__(self):
-        super(MultiTaskAttentionNetwork, self).__init__()
+        super(MTANModel, self).__init__()
         self.shared_network = SharedNetwork()
         
-        # Task-specific networks for EWT, Gs, Tr, ΦPSⅡ
-        self.task_networks = [TaskSpecificNetwork() for _ in range(4)]
+        # 多任务的注意力模块
+        self.attention_modules = [
+            AttentionModule(64),
+            AttentionModule(64),
+            AttentionModule(64)
+        ]
         
-        # Attention modules applied to specific layers
-        self.attention_modules = [AttentionModule(256), AttentionModule(128), AttentionModule(128)]
+        # 任务专属网络
+        self.task_networks = [tf.keras.Sequential([
+            tf.keras.layers.Dense(64, activation='relu'),
+            tf.keras.layers.Dense(1)
+        ]) for _ in range(4)]
 
     def call(self, inputs):
-        # Shared feature extraction
-        x = self.shared_network(inputs)
+        # 共享主网络
+        shared_features = self.shared_network(inputs)
         
-        # Apply attention to specific layers
-        attention_outputs = []
-        for task_network, attention_module in zip(self.task_networks, self.attention_modules):
-            x_attention = attention_module(x)
-            attention_outputs.append(task_network(x_attention))
-
-        return attention_outputs
-
-# Instantiate the model
-model = MultiTaskAttentionNetwork()
-model.compile(optimizer=Adam(learning_rate=0.001), 
-              loss='mse', 
-              loss_weights=[0.25, 0.25, 0.25, 0.25])
-
-# Define input shapes for the model
-input_shapes = [(None, 6), (None, 12), (None, 2), (None, 5)]
-inputs = [tf.keras.Input(shape=shape[1:]) for shape in input_shapes]
-outputs = model(inputs)
-
-# Build the model
-model = Model(inputs=inputs, outputs=outputs)
-model.summary()
+        # 应用注意力模块并进行连接
+        attention_output, attention_prev = self.attention_modules[0](shared_features)
+        for i in range(1, len(self.attention_modules)):
+            attention_output, attention_prev = self.attention_modules[i](attention_output, attention_prev)
+        
+        # 分别使用不同的任务网络进行预测
+        outputs = [task_net(attention_output) for task_net in self.task_networks]
+        return outputs
