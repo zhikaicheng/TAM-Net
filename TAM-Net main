@@ -1,0 +1,115 @@
+import tensorflow as tf
+from tensorflow.keras.layers import Dense, Concatenate, Layer
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
+
+class ResidualBlock(Layer):
+    def __init__(self, hidden_dim):
+        super(ResidualBlock, self).__init__()
+        self.dense1 = Dense(hidden_dim, activation='relu')
+        self.dense2 = Dense(hidden_dim)
+        self.relu = tf.keras.layers.ReLU()
+
+    def call(self, x):
+        residual = x
+        x = self.dense1(x)
+        x = self.dense2(x)
+        x += residual
+        return self.relu(x)
+
+class AttentionModule(Layer):
+    def __init__(self, hidden_dim):
+        super(AttentionModule, self).__init__()
+        self.attention_weights = Dense(hidden_dim, activation='softmax')
+
+    def call(self, x):
+        return x * self.attention_weights(x)
+
+class SharedNetwork(Model):
+    def __init__(self):
+        super(SharedNetwork, self).__init__()
+        # Initial encoding layers for each feature set
+        self.spi_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
+        self.tei_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
+        self.thi_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
+        self.sti_fc = [Dense(128, activation='relu'), Dense(128, activation='relu'), Dense(64, activation='relu')]
+
+        # Concatenate layer and additional FC layer after concatenation
+        self.concat_fc = Dense(256, activation='relu')
+        self.final_fc = Dense(64, activation='relu')
+        
+        # Residual blocks
+        self.res_blocks = [ResidualBlock(128) for _ in range(3)]
+        
+    def call(self, inputs):
+        spi, tei, thi, sti = inputs
+        
+        # Encode each feature type
+        for fc_layer in self.spi_fc:
+            spi = fc_layer(spi)
+        for fc_layer in self.tei_fc:
+            tei = fc_layer(tei)
+        for fc_layer in self.thi_fc:
+            thi = fc_layer(thi)
+        for fc_layer in self.sti_fc:
+            sti = fc_layer(sti)
+
+        # Concatenate encoded features
+        x = Concatenate()([spi, tei, thi, sti])
+        x = self.concat_fc(x)
+        
+        # Residual blocks
+        for res_block in self.res_blocks:
+            x = res_block(x)
+        
+        # Final FC layer after residual blocks
+        x = self.final_fc(x)
+        return x
+
+class TaskSpecificNetwork(Model):
+    def __init__(self):
+        super(TaskSpecificNetwork, self).__init__()
+        self.dense1 = Dense(64, activation='relu')
+        self.output_layer = Dense(1)
+
+    def call(self, x):
+        x = self.dense1(x)
+        return self.output_layer(x)
+
+class MultiTaskAttentionNetwork(Model):
+    def __init__(self):
+        super(MultiTaskAttentionNetwork, self).__init__()
+        self.shared_network = SharedNetwork()
+        
+        # Task-specific networks for EWT, Gs, Tr, ΦPSⅡ
+        self.task_networks = [TaskSpecificNetwork() for _ in range(4)]
+        
+        # Attention modules applied to specific layers
+        self.attention_modules = [AttentionModule(256), AttentionModule(128), AttentionModule(128)]
+
+    def call(self, inputs):
+        # Shared feature extraction
+        x = self.shared_network(inputs)
+        
+        # Apply attention to specific layers
+        attention_outputs = []
+        for task_network, attention_module in zip(self.task_networks, self.attention_modules):
+            x_attention = attention_module(x)
+            attention_outputs.append(task_network(x_attention))
+
+        return attention_outputs
+
+# Instantiate the model
+model = MultiTaskAttentionNetwork()
+model.compile(optimizer=Adam(learning_rate=0.001), 
+              loss='mse', 
+              loss_weights=[0.25, 0.25, 0.25, 0.25])
+
+# Define input shapes for the model
+input_shapes = [(None, 6), (None, 12), (None, 2), (None, 5)]
+inputs = [tf.keras.Input(shape=shape[1:]) for shape in input_shapes]
+outputs = model(inputs)
+
+# Build the model
+model = Model(inputs=inputs, outputs=outputs)
+model.summary()
